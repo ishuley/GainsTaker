@@ -34,7 +34,6 @@ class Exchange(object):
     # returns a formatted super().get_class_due()
     @staticmethod
     def get_tax_due(spend_total_usd: Decimal, cost_basis_usd: Decimal = None, term: str = 'short') -> Decimal or str:
-        # god bless America
         term = term.lower()
         if term != 'short' and term != 'long':
             return 'invalidTerm'
