@@ -1,2 +1,2 @@
 # GainsTaker
-Performs a specified cryptocurrrency trade on supported exchange's APIs, after automatically making a preceding trade to take out US capital gains dues in a USD stablecoin
+Performs a specified cryptocurrrency market trade on supported exchange's APIs, preceding it automatically with a trade to take out US capital gains dues as a USD stablecoin
