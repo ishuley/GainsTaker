@@ -194,23 +194,56 @@ class Binance(Exchange):
     # make the tax trade(s) before the main trade's function gets called
     # figures out the necessary trades to convert the given asset to the USDC amount given
     # then executes those trades using execute_trade()
-    def execute_tax_trade(self, tax_due_usd: Decimal, asset_being_sold: str) -> Decimal:
+    def execute_tax_trade(self, tax_due_usd: Decimal, asset_being_sold: str) -> dict:
         usdc_path = self._get_pairing_path_to_usdc(asset_being_sold)  # so we know HOW to buy USDC
         if len(usdc_path) == 1:  # we have a direct pairing with USDC available
             pairing = self.get_valid_pairing('USDC', asset_being_sold)  # figure out how to buy USDC in a valid pairing
             return self.execute_trade(pairing[0], pairing[3], tax_due_usd)
             # acquire USDC using execute_trade(), return how much was actually bought
-        else:  # while relying on BTC as a bridge, len(usdc_path) will always be 2 here
-            btc_pairing = self.get_valid_pairing(asset_being_sold, 'BTC')  # figure out how to buy BTC
-            btc_received = self.execute_trade(btc_pairing[0], btc_pairing[3], tax_due_usd)
-            # acquire BTC with execute_trade(), assign how much was actually bought to a variable
-            return self.execute_trade('BTCUSDC', 'sell', btc_received)
-            # executes trade and returns how much USDC was acquired
+
+        # while relying on BTC as a bridge, len(usdc_path) will always be 2 here
+        btc_pairing = self.get_valid_pairing(asset_being_sold, 'BTC')  # figure out how to buy BTC
+        btc_received = self.execute_trade(btc_pairing[0], btc_pairing[3], tax_due_usd)['cummulativeQuoteQty']
+        # acquire BTC with execute_trade(), assign how much was actually bought to a variable
+        return self.execute_trade('BTCUSDC', 'sell', btc_received)
+        # execute_trade(), returning how much USDC was acquired
         # format_a_decimal() isn't necessary in either of these conditionals
         # because execute_trade() calls it before returning
 
-    def execute_trade(self, pairing: str, side: str, qty: Decimal) -> Decimal:
+    # execute_trade() actually executes the trade
+    def execute_trade(self, pairing: str, side: str, qty: Decimal) -> dict:
+        # input checks and formatting
+        pairing = pairing.upper()
+        side = side.upper()
+        if side == 'BID':
+            side = 'BUY'
+        if side == 'ASK':
+            side = 'SELL'
+        qty = str(qty)
 
+        # construct the query_string and signature
+        symbol = 'symbol=' + pairing + '&'
+        side = 'side=' + side + '&'
+        type_ = 'type=' + 'MARKET&'  # TODO implement limit orders someday maybe
+        quantity = 'quantity=' + qty + '&'
+        newOrderRespType = 'newOrderRespType=RESULT&'
+        timestamp = 'timestamp=' + str(int(time.time()) * 1000)
+        query_string = symbol + side + type_ + quantity + newOrderRespType + timestamp
+        sig = self.get_signature(query_string)
+
+        # POST the order
+        order = requests.post(self.API_URL + 'v3/order/test?' + query_string + '&signature=' + sig,
+                              headers=self.headers)
+        # TODO move from test orders to real orders ---^
+
+        # parse and display result of order posting
+        result = json.loads(order.text)
+
+        return result
+    # this should work, but I haven't tested it yet because that requires me sending money to binance
+    # which i'll do soon. - sending a POST to v3/order/test seems to not return a dictionary value for order,
+    # i'm thinking because the order doesn't get placed,
+    # but I'm getting status_code 200 so all seems to be working, we'll give it a whirl
 
     # get_pairing_list() generates a list of possible pairings available on binance
     # oddly, USDCBTC returns as a valid pairing, when it is not, resulting in changes to several of
@@ -224,7 +257,7 @@ class Binance(Exchange):
     # _get_asset_symbols() generates a list of asset symbols
     # pairing_side:'quote' produces a list of symbols that are the first part of a pairing
     # pairing_side:'base' produces a list of symbols that are in the second part (all of them,
-    # in one pairing or another use 'base' to produce a list of every asset binance handles
+    # in one pairing or another. use 'base' to generate a list of every asset binance handles
     def _get_asset_symbols(self, pairing_side: str) -> Iterator[str] or tuple:
         pairing_side = pairing_side.lower()
         input_check = self._input_check(None, None, None, None, pairing_side)
