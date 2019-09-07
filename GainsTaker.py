@@ -1,3 +1,6 @@
+# this is my first actually useful program. my gratitude to nick winn, pyslackers chat room, /r/learnpython,
+# learnprogramming.academy, real python, and others for helping me get this far!
+
 import requests
 import json
 import time
@@ -5,7 +8,7 @@ import hmac
 import hashlib
 import decimal
 from decimal import Decimal
-from typing import Iterator, Tuple
+from typing import Tuple
 
 decimal.getcontext().prec = 100
 decimal_zero = Decimal()
@@ -13,6 +16,8 @@ decimal_zero = Decimal()
 
 # buy/bid and sell/ask always refers to the quote asset (the first asset) (ex: ARDRETH : buy ARDR or sell ARDR)
 # the second asset is the 'base' asset (ex: ETH is base asset in ARDRETH)
+# except in get_pairing_price, side of buy always refers to quote asset, side of sell always refers to base
+# examples in comments above the functions
 
 
 class Exchange(object):
@@ -33,7 +38,8 @@ class Exchange(object):
     # my take is to implement that in a get_tax_due() function in the subclass that
     # returns a formatted super().get_class_due()
     @staticmethod
-    def get_tax_due(spend_total_usd: Decimal, cost_basis_usd: Decimal = None, term: str = 'short') -> Decimal or str:
+    def get_tax_due(spend_total_usd: Decimal, cost_basis_usd: Decimal = None, term: str = 'short')\
+            -> Decimal or str:
         term = term.lower()
         if term != 'short' and term != 'long':
             invalid_term = list()
@@ -85,7 +91,6 @@ class Binance(Exchange):
     def get_pairing_price(self, pairing: str, side: str = 'buy', qty=decimal_zero) -> tuple:
         side = side.lower()
         pairing = pairing.upper()
-        flip_symbols = False
         input_check = self._input_check(pairing, side, qty)
         if input_check is not True:  # _input_check() either returns True, or a tuple containing applicable error ids
             # so 'if not input_check' doesn't work because that's expecting a False it'll never get
@@ -94,7 +99,6 @@ class Binance(Exchange):
         else:
             if pairing == 'USDCBTC':  # oddly, USDCBTC returns as a valid pairing, but the only valid market is BTCUSDC
                 pairing = 'BTCUSDC'
-                flip_symbols = True
                 if side == 'sell':
                     side = 'buy'
                 else:
@@ -111,7 +115,7 @@ class Binance(Exchange):
             price = decimal_zero
             buy_asset = None
             buy_asset_qty = None
-            symbol1, symbol2 = self._split_a_pairing(pairing)
+            symbol1, symbol2 = self._split_a_pairing(pairing, ret_valid_pairing=True)
             for order in order_book:  # determines how much we'll have to pay using orderbook information
                 #  see binance's api documentation for more details
                 if 'USDC' in pairing:
@@ -128,16 +132,10 @@ class Binance(Exchange):
                         qty_counter += Decimal(order[1])
             if book == 'asks':
                 buy_asset_qty = qty / price
-                if flip_symbols:  # if flip symbols is true, USDCBTC got sent instead of BTCUSDC
-                    buy_asset = symbol2
-                else:
-                    buy_asset = symbol1
+                buy_asset = symbol1
             elif book == 'bids':
                 buy_asset_qty = qty * price
-                if flip_symbols:
-                    buy_asset = symbol1
-                else:
-                    buy_asset = symbol2
+                buy_asset = symbol2
             return self.format_a_decimal(buy_asset_qty), buy_asset
 
     # get_price_usdc() is like a get_pairing_price(), except it is exclusively USDC, and if a pairing
@@ -158,7 +156,7 @@ class Binance(Exchange):
                     other_side = 'sell'
                 else:
                     other_side = 'buy'
-                return self.get_pairing_price('BTCUSDC', other_side, qty)
+                return self.get_pairing_price('USDCBTC', other_side, qty)
             pairing_path = self._get_pairing_path_to_usdc(symbol)  # figures out the quickest path to USDC
             pairing_path_length = len(pairing_path)  # tells us whether we're using BTC as a go between
             # tuple contains two pairings if we are
@@ -175,6 +173,8 @@ class Binance(Exchange):
 
     # I'm going to include the option to use your entire remaining balance of an asset in a trade,
     # get_single_balance() will fetch that balance
+    # I also ended up using this in execute_trade() to deduce the balance of new crypto after the transaction,
+    # since I'm not seeing a way to do this through the API itself
     def get_single_balance(self, symbol: str) -> Tuple[Decimal, str] or str:
         symbol = symbol.upper()
         input_check = self._input_check(None, None, None, symbol)
@@ -194,24 +194,25 @@ class Binance(Exchange):
     # make the tax trade(s) before the main trade's function gets called
     # figures out the necessary trades to convert the given asset to the USDC amount given
     # then executes those trades using execute_trade()
-    def execute_tax_trade(self, tax_due_usd: Decimal, asset_being_sold: str) -> dict:
+    def execute_tax_trade(self, tax_due_usd: Decimal, asset_being_sold: str):
         usdc_path = self._get_pairing_path_to_usdc(asset_being_sold)  # so we know HOW to buy USDC
+
         if len(usdc_path) == 1:  # we have a direct pairing with USDC available
             pairing = self.get_valid_pairing('USDC', asset_being_sold)  # figure out how to buy USDC in a valid pairing
+            # acquire USDC using execute_trade(), return how much was actually bought with Binance's response
             return self.execute_trade(pairing[0], pairing[3], tax_due_usd)
-            # acquire USDC using execute_trade(), return how much was actually bought
 
         # while relying on BTC as a bridge, len(usdc_path) will always be 2 here
         btc_pairing = self.get_valid_pairing(asset_being_sold, 'BTC')  # figure out how to buy BTC
-        btc_received = self.execute_trade(btc_pairing[0], btc_pairing[3], tax_due_usd)['cummulativeQuoteQty']
+
         # acquire BTC with execute_trade(), assign how much was actually bought to a variable
+        btc_received = self.execute_trade(btc_pairing[0], btc_pairing[3], tax_due_usd)[0]
         return self.execute_trade('BTCUSDC', 'sell', btc_received)
-        # execute_trade(), returning how much USDC was acquired
-        # format_a_decimal() isn't necessary in either of these conditionals
-        # because execute_trade() calls it before returning
+        # format_a_decimal() isn't necessary in either of these conditionals because execute_trade() calls it
+        # before returning
 
     # execute_trade() actually executes the trade
-    def execute_trade(self, pairing: str, side: str, qty: Decimal) -> dict:
+    def execute_trade(self, pairing: str, side: str, qty: Decimal) -> tuple:
         # input checks and formatting
         pairing = pairing.upper()
         side = side.upper()
@@ -219,46 +220,63 @@ class Binance(Exchange):
             side = 'BUY'
         if side == 'ASK':
             side = 'SELL'
+        qty = self.format_a_decimal(qty)
         qty = str(qty)
+
+        # split the pairing, determine the balance of the asset being gained,
+        # store the balance compare with new balance after the order is executed
+        # so it can be returned, I don't see a way to do this through Binance API
+        # an alternative approach might've been to use newOrderRespType=FULL below, and
+        # derive it from the 'fills' values, but this seemed easier
+        quote_asset, base_asset = self._split_a_pairing(pairing)
+        if side == 'BUY':
+            asset_to_use = quote_asset
+        else:
+            asset_to_use = base_asset
+        bal_before_acquiring = self.get_single_balance(asset_to_use)
 
         # construct the query_string and signature
         symbol = 'symbol=' + pairing + '&'
         side = 'side=' + side + '&'
         type_ = 'type=' + 'MARKET&'  # TODO implement limit orders someday maybe
         quantity = 'quantity=' + qty + '&'
-        newOrderRespType = 'newOrderRespType=RESULT&'
+        new_order_resp_type = 'newOrderRespType=RESULT&'
         timestamp = 'timestamp=' + str(int(time.time()) * 1000)
-        query_string = symbol + side + type_ + quantity + newOrderRespType + timestamp
+        query_string = symbol + side + type_ + quantity + new_order_resp_type + timestamp
         sig = self.get_signature(query_string)
 
         # POST the order
-        order = requests.post(self.API_URL + 'v3/order/test?' + query_string + '&signature=' + sig,
-                              headers=self.headers)
-        # TODO move from test orders to real orders ---^
+        order = requests.post(self.API_URL + 'v3/order?' + query_string + '&signature=' + sig, headers=self.headers)
 
-        # parse and display result of order posting
+        # parse and return results
         result = json.loads(order.text)
-
-        return result
+        bal_after_acquiring = self.get_single_balance(asset_to_use)  # returns a Decimal
+        amt_of_asset_acquired = Decimal(bal_after_acquiring[0]) - Decimal(bal_before_acquiring[0])
+        # these are only casted as Decimal to humor my IDE ^
+        amt_of_asset_acquired = self.format_a_decimal(amt_of_asset_acquired)
+        return amt_of_asset_acquired, asset_to_use, result
+        # returns a tuple: (Decimal containing amount acquired, asset acquired, binance's response to POST)
     # this should work, but I haven't tested it yet because that requires me sending money to binance
     # which i'll do soon. - sending a POST to v3/order/test seems to not return a dictionary value for order,
     # i'm thinking because the order doesn't get placed,
-    # but I'm getting status_code 200 so all seems to be working, we'll give it a whirl
+    # but I'm getting status_code 200 so all seems to be working, we'll give it a whirl without /test
 
-    # get_pairing_list() generates a list of possible pairings available on binance
+    # get_pairing_list() returns a tuple of possible pairings available on binance
     # oddly, USDCBTC returns as a valid pairing, when it is not, resulting in changes to several of
     # this class' functions
-    def get_pairing_list(self) -> Iterator[str]:
+    def get_pairing_list(self) -> tuple:
         symbols_string = requests.get(self.API_URL + 'v1/exchangeInfo')
         symbols_json = json.loads(symbols_string.text)
+        return_list = []
         for item in symbols_json['symbols']:
-            yield item['symbol']
+            return_list.append(item['symbol'])
+        return tuple(return_list)
 
-    # _get_asset_symbols() generates a list of asset symbols
+    # _get_asset_symbols() returns a tuple of asset symbols
     # pairing_side:'quote' produces a list of symbols that are the first part of a pairing
     # pairing_side:'base' produces a list of symbols that are in the second part (all of them,
     # in one pairing or another. use 'base' to generate a list of every asset binance handles
-    def _get_asset_symbols(self, pairing_side: str) -> Iterator[str] or tuple:
+    def _get_asset_symbols(self, pairing_side: str) -> tuple:
         pairing_side = pairing_side.lower()
         input_check = self._input_check(None, None, None, None, pairing_side)
         if input_check is not True:
@@ -269,8 +287,7 @@ class Binance(Exchange):
             assets_set = set()
             for item in symbols_json['symbols']:
                 assets_set.add(item[pairing_side + 'Asset'])  # add each asset to a set to remove duplicates
-            for item in assets_set:
-                yield item
+            return tuple(assets_set)
 
     # get_valid_pairing() returns a tuple for a valid pairing if one exists for the given assets
     # it returns the side assuming you want to acquire the first symbol in the parameters
@@ -278,22 +295,25 @@ class Binance(Exchange):
     # (ex: ARDRETH only exists but you send ETH as quote asset and ARDR as base), then it returns sell instead of buy
     def get_valid_pairing(self, quote_asset: str, base_asset: str) -> Tuple[str, str, str, str] or tuple:
         base_asset, quote_asset = base_asset.upper(), quote_asset.upper()
+
         input_check_q = self._input_check(None, None, None, quote_asset, None)
         input_check_b = self._input_check(None, None, None, base_asset, None)
         input_check_pqb = self._input_check(quote_asset + base_asset)
         input_check_pbq = self._input_check(base_asset + quote_asset)
+
         if input_check_b is not True:
             return input_check_b
         if input_check_q is not True:
             return input_check_q
         if input_check_pqb is not True and input_check_pbq is not True:
             return input_check_pqb
-        if input_check_pqb:
+
+        if input_check_pqb is True:
             return quote_asset + base_asset, \
                    quote_asset, \
                    base_asset, \
                    'buy'
-        elif input_check_pbq:
+        elif input_check_pbq is True:
             return base_asset + quote_asset, \
                    base_asset, \
                    quote_asset, \
@@ -301,40 +321,49 @@ class Binance(Exchange):
         # returns: (pairing, base asset symbol, quote asset symbol, side)
 
     # _split_a_pairing() takes a pairing and returns two separate asset symbols
-    # switches them for you similar to get_valid_pairing() if necessary
-    def _split_a_pairing(self, pairing_to_split: str) -> Tuple[str, str] or str:
-        quote_asset = None
-        base_asset = None
-        for symbol in self._get_asset_symbols('quote'):
-            if symbol in pairing_to_split:
-                quote_asset = symbol
-                break
-        for symbol in self._get_asset_symbols('base'):
-            if symbol in pairing_to_split and symbol not in quote_asset:
-                base_asset = symbol
-                break
-        input_check_qa = self._input_check(None, None, None, quote_asset)
-        input_check_ba = self._input_check(None, None, None, base_asset)
-        qa_plus_ba = quote_asset + base_asset
-        ba_plus_qa = base_asset + quote_asset
-        input_check_p1 = self._input_check(qa_plus_ba)
-        input_check_p2 = self._input_check(ba_plus_qa)
-        # error checking below this line
+    # if ret_valid_pairing is False it returns two valid symbols in the order passed in,
+    # regardless of if there's a valid pairing
+    # if ret_valid_pairing is True it will flip the symbols around to make a valid pairing if necessary
+    def _split_a_pairing(self, pairing_to_split: str, ret_valid_pairing: bool = False) -> Tuple[str, str] or str:
+        quote_asset, base_asset = self._pair_splitter(pairing_to_split)
+        input_check_qa = self._input_check(symbol=quote_asset)
+        input_check_ba = self._input_check(symbol=base_asset)
         if input_check_qa is not True:
             return input_check_qa
-        if input_check_ba is not True:
+        elif input_check_ba is not True:
             return input_check_ba
-        # checks each symbol as base and quote, and returns the tuple in correct order
-        if self._input_check(qa_plus_ba):
+        if ret_valid_pairing is False:
             return quote_asset, base_asset
-        elif self._input_check(ba_plus_qa):
+        qa_plus_ba = quote_asset + base_asset
+        ba_plus_qa = base_asset + quote_asset
+        input_check_p1 = self._input_check(pairing=qa_plus_ba)
+        input_check_p2 = self._input_check(pairing=ba_plus_qa)
+        if input_check_p1 is True:  # this has to have 'is True,' a tuple is returned otherwise, tuple isn't false
+            return quote_asset, base_asset
+        elif input_check_p2 is True:
             return base_asset, quote_asset
-        # error checking below this line
-        else:  # this only happens if one of the pairings is the problem
+        else:
             if input_check_p1 is not True:
                 return input_check_p1
             if input_check_p2 is not True:
                 return input_check_p2
+
+    # does the actual splitting for _split_a_pairing()
+    def _pair_splitter(self, pairing_to_split: str) -> Tuple[str, str]:
+        # input will be checked in _split_a_pairing(), so no need for that here
+        asset1 = ''
+        asset2 = ''
+        for symbol in self._get_asset_symbols('base'):
+            if symbol in pairing_to_split:
+                asset1 = symbol
+                break
+        for symbol in self._get_asset_symbols('base'):
+            if symbol in pairing_to_split and symbol not in asset1:
+                asset2 = pairing_to_split.replace(asset1, '')
+                break
+        if asset2 + asset1 == pairing_to_split:
+            return asset2, asset1
+        return asset1, asset2
 
     # USDC is the asset this program has to use every single transaction, so if a pairing with it
     # doesn't exist this function returns a 'pairing path' to USDC so I can pay the tax man
@@ -363,7 +392,7 @@ class Binance(Exchange):
         # TODO rethinking this to work around that sounds like a fun challenge for later
 
     # formatting for these parameters (like pairing.upper() or side.lower()
-    # in the following functions should done the functions that send them
+    # in the following functions should done in the functions that send them
     # since they use those arguments too
 
     # these functions check user input in the cli, and tells you if you constructed something wrong in a gui
