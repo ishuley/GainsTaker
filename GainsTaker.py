@@ -69,8 +69,9 @@ class Binance(Exchange):
     # takes a Decimal and returns it with 6 decimal places, rounded up or down depending on round_direction
     # round_direction: ROUND_DOWN, ROUND_UP
     @staticmethod
-    def format_a_decimal(dec: Decimal, round_direction: str = 'ROUND_DOWN') -> Decimal:
-        return Decimal(dec.quantize(Decimal('.000001'), rounding=round_direction))
+    def format_a_decimal(dec: Decimal, round_direction: str = 'ROUND_DOWN',
+                         lot_size: Decimal = Decimal('.00000001')) -> Decimal:
+        return Decimal(dec.quantize(Decimal(lot_size), rounding=round_direction))
 
     # Binance gets its own get_tax_due() because it only works with up to 6 decimal places, so it needs
     # to be formatted as such
@@ -88,7 +89,7 @@ class Binance(Exchange):
     #       pairing_side: 'quote' or 'base'
 
     # BTCUSDC; buy : send a USDC value (get back BTC), sell : send a BTC value (get back USDC)
-    def get_pairing_price(self, pairing: str, side: str = 'buy', qty=decimal_zero) -> tuple:
+    def get_pairing_price(self, pairing: str, side: str = 'buy', qty: Decimal = decimal_zero) -> tuple:
         side = side.lower()
         pairing = pairing.upper()
         input_check = self._input_check(pairing, side, qty)
@@ -104,9 +105,9 @@ class Binance(Exchange):
                 else:
                     side = 'sell'
             if side == 'buy':  # determines which side of the orderbook to use
-                book = 'asks'
-            else:
                 book = 'bids'
+            else:
+                book = 'asks'
             api_url = self.API_URL + "v1/depth"
             orders = requests.get(api_url, params={'symbol': pairing, 'limit': 1000})
             orders_json = json.loads(orders.text)
@@ -212,7 +213,7 @@ class Binance(Exchange):
         # before returning
 
     # execute_trade() actually executes the trade
-    def execute_trade(self, pairing: str, side: str, qty: Decimal) -> tuple:
+    def execute_trade(self, pairing: str, side: str, qty) -> tuple:
         # input checks and formatting
         pairing = pairing.upper()
         side = side.upper()
@@ -294,6 +295,7 @@ class Binance(Exchange):
     # so if the asset sides (quote, base) had to be switched for a valid pairing, it also switches the side
     # (ex: ARDRETH only exists but you send ETH as quote asset and ARDR as base), then it returns sell instead of buy
     def get_valid_pairing(self, quote_asset: str, base_asset: str) -> Tuple[str, str, str, str] or tuple:
+
         base_asset, quote_asset = base_asset.upper(), quote_asset.upper()
 
         input_check_q = self._input_check(None, None, None, quote_asset, None)
@@ -334,10 +336,12 @@ class Binance(Exchange):
             return input_check_ba
         if ret_valid_pairing is False:
             return quote_asset, base_asset
+
         qa_plus_ba = quote_asset + base_asset
         ba_plus_qa = base_asset + quote_asset
         input_check_p1 = self._input_check(pairing=qa_plus_ba)
         input_check_p2 = self._input_check(pairing=ba_plus_qa)
+
         if input_check_p1 is True:  # this has to have 'is True,' a tuple is returned otherwise, tuple isn't false
             return quote_asset, base_asset
         elif input_check_p2 is True:
@@ -457,3 +461,13 @@ class Binance(Exchange):
     #       qty: decimal.Decimal('4.513')
     #       symbol: 'ETH'
     #       pairing_side: 'quote' or 'base'
+
+    # I need this to determine the lot size in execute_trade()
+    def _get_pairing_lot_size(self, pairing: str) -> str:
+        symbols_string = requests.get(self.API_URL + 'v1/exchangeInfo')
+        symbols_json = json.loads(symbols_string.text)
+        for item in symbols_json['symbols']:
+            if item['symbol'] == pairing:
+                for filter_dict in item['filters']:
+                    if filter_dict['filterType'] == 'LOT_SIZE':
+                        return str(filter_dict['minQty'])[1:]
