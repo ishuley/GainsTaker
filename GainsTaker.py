@@ -1,5 +1,5 @@
-# this is my first actually useful program. my gratitude to nick winn, pyslackers chat room, /r/learnpython,
-# learnprogramming.academy, real python, and others for helping me get this far!
+# this is my first actually useful program. my gratitude to nick winn, pyslackers chat room (EdKeyes and dd82),
+# /r/learnpython, learnprogramming.academy, real python, and others for helping me get this far!
 
 import requests
 import json
@@ -89,7 +89,7 @@ class Binance(Exchange):
     #       pairing_side: 'quote' or 'base'
 
     # BTCUSDC; buy : send a USDC value (get back BTC), sell : send a BTC value (get back USDC)
-    def get_pairing_price(self, pairing: str, side: str = 'buy', qty: Decimal = decimal_zero) -> tuple:
+    def get_pairing_price(self, pairing: str, qty: Decimal, side: str = 'buy') -> tuple:
         side = side.lower()
         pairing = pairing.upper()
         input_check = self._input_check(pairing, side, qty)
@@ -142,7 +142,7 @@ class Binance(Exchange):
     # get_price_usdc() is like a get_pairing_price(), except it is exclusively USDC, and if a pairing
     # doesn't exist, it uses BTC as a go between and returns the appropriate values as though it did
     # so now we can get a USDC price for every asset available on Binance
-    def get_price_usdc(self, symbol: str, qty: Decimal = decimal_zero, side: str = 'buy') -> Tuple[Decimal, str] or str:
+    def get_price_usdc(self, symbol: str, qty: Decimal, side: str = 'buy') -> Tuple[Decimal, str] or str:
         symbol = symbol.upper()
         side = side.lower()
         input_check = self._input_check(None, side, qty, symbol)
@@ -157,19 +157,19 @@ class Binance(Exchange):
                     other_side = 'sell'
                 else:
                     other_side = 'buy'
-                return self.get_pairing_price('USDCBTC', other_side, qty)
+                return self.get_pairing_price('USDCBTC', qty, other_side)
             pairing_path = self._get_pairing_path_to_usdc(symbol)  # figures out the quickest path to USDC
             pairing_path_length = len(pairing_path)  # tells us whether we're using BTC as a go between
             # tuple contains two pairings if we are
             if pairing_path_length == 1:  # if not
-                return self.get_pairing_price(pairing=pairing_path[0], side=side, qty=qty)
+                return self.get_pairing_price(pairing=pairing_path[0], qty=qty, side=side)
             elif pairing_path_length == 2:  # if so
-                other_qty = self.get_pairing_price(pairing_path[0], side=side, qty=qty)
+                other_qty = self.get_pairing_price(pairing_path[0], qty=qty, side=side)
                 if other_qty[1] == 'BTC':
                     ret_symbol = 'USDC'
                 else:
                     ret_symbol = symbol
-                return self.get_pairing_price(pairing=pairing_path[1], side=side, qty=other_qty[0])[0], ret_symbol
+                return self.get_pairing_price(pairing=pairing_path[1], qty=other_qty[0], side=side)[0], ret_symbol
                 # format_a_decimal() happens in get_pairing_price(), so no need to do that here
 
     # I'm going to include the option to use your entire remaining balance of an asset in a trade,
@@ -195,25 +195,25 @@ class Binance(Exchange):
     # make the tax trade(s) before the main trade's function gets called
     # figures out the necessary trades to convert the given asset to the USDC amount given
     # then executes those trades using execute_trade()
-    def execute_tax_trade(self, tax_due_usd: Decimal, asset_being_sold: str):
+    def execute_tax_trade(self, asset_being_sold: str,  tax_due_usd: Decimal):
         usdc_path = self._get_pairing_path_to_usdc(asset_being_sold)  # so we know HOW to buy USDC
 
         if len(usdc_path) == 1:  # we have a direct pairing with USDC available
             pairing = self.get_valid_pairing('USDC', asset_being_sold)  # figure out how to buy USDC in a valid pairing
             # acquire USDC using execute_trade(), return how much was actually bought with Binance's response
-            return self.execute_trade(pairing[0], pairing[3], tax_due_usd)
+            return self.execute_trade(pairing[0], tax_due_usd, pairing[3])
 
         # while relying on BTC as a bridge, len(usdc_path) will always be 2 here
         btc_pairing = self.get_valid_pairing(asset_being_sold, 'BTC')  # figure out how to buy BTC
 
         # acquire BTC with execute_trade(), assign how much was actually bought to a variable
-        btc_received = self.execute_trade(btc_pairing[0], btc_pairing[3], tax_due_usd)[0]
-        return self.execute_trade('BTCUSDC', 'sell', btc_received)
+        btc_received = self.execute_trade(btc_pairing[0], tax_due_usd, btc_pairing[3])[0]
+        return self.execute_trade('BTCUSDC', btc_received, 'sell')
         # format_a_decimal() isn't necessary in either of these conditionals because execute_trade() calls it
         # before returning
 
     # execute_trade() actually executes the trade
-    def execute_trade(self, pairing: str, side: str, qty) -> tuple:
+    def execute_trade(self, pairing: str, qty: Decimal, side: str = 'buy') -> tuple:
         # input checks and formatting
         pairing = pairing.upper()
         side = side.upper()
@@ -221,7 +221,8 @@ class Binance(Exchange):
             side = 'BUY'
         if side == 'ASK':
             side = 'SELL'
-        qty = self.format_a_decimal(qty)
+        lot_size = Decimal(self._get_pairing_lot_size(pairing))
+        qty = self.format_a_decimal(qty, lot_size=lot_size)
         qty = str(qty)
 
         # split the pairing, determine the balance of the asset being gained,
@@ -257,10 +258,6 @@ class Binance(Exchange):
         amt_of_asset_acquired = self.format_a_decimal(amt_of_asset_acquired)
         return amt_of_asset_acquired, asset_to_use, result
         # returns a tuple: (Decimal containing amount acquired, asset acquired, binance's response to POST)
-    # this should work, but I haven't tested it yet because that requires me sending money to binance
-    # which i'll do soon. - sending a POST to v3/order/test seems to not return a dictionary value for order,
-    # i'm thinking because the order doesn't get placed,
-    # but I'm getting status_code 200 so all seems to be working, we'll give it a whirl without /test
 
     # get_pairing_list() returns a tuple of possible pairings available on binance
     # oddly, USDCBTC returns as a valid pairing, when it is not, resulting in changes to several of
