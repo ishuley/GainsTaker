@@ -36,7 +36,7 @@ class Exchange(object):
 
     # get_tax_due() will need to be formatted at some point to however the specific exchange needs its values formatted
     # my take is to implement that in a get_tax_due() function in the subclass that
-    # returns a formatted super().get_class_due()
+    # returns a formatted super().get_tax_due()
     @staticmethod
     def get_tax_due(spend_total_usd: Decimal, cost_basis_usd: Decimal = None, term: str = 'short')\
             -> Decimal or str:
@@ -69,15 +69,18 @@ class Binance(Exchange):
     # takes a Decimal and returns it with 6 decimal places, rounded up or down depending on round_direction
     # round_direction: ROUND_DOWN, ROUND_UP
     @staticmethod
-    def format_a_decimal(dec: Decimal, round_direction: str = 'ROUND_DOWN',
-                         lot_size: Decimal = Decimal('.00000001')) -> Decimal:
+    def format_a_decimal(dec: Decimal, lot_size: str, round_direction: str = 'ROUND_DOWN') -> Decimal:
+        lot_size = Decimal(lot_size)
         return Decimal(dec.quantize(Decimal(lot_size), rounding=round_direction))
 
     # Binance gets its own get_tax_due() because it only works with up to 6 decimal places, so it needs
     # to be formatted as such
     def get_tax_due(self, spend_total_usd: Decimal, cost_basis_usd: Decimal = None, term: str = 'short') \
             -> Decimal or str:
-        return self.format_a_decimal(super().get_tax_due(spend_total_usd, cost_basis_usd, term), 'ROUND_UP')
+        return self.format_a_decimal(super().get_tax_due(spend_total_usd, cost_basis_usd, term),
+                                     lot_size='.001', round_direction='ROUND_UP')
+        # LOT_SIZE of .001 here because although though usdc supports more decimal places,
+        # this will be getting rounded up for the tax man anyway
 
     # The following functions work with information from Binance using the following formats:
 
@@ -88,7 +91,6 @@ class Binance(Exchange):
     #       symbol: 'ETH'
     #       pairing_side: 'quote' or 'base'
 
-    # BTCUSDC; buy : send a USDC value (get back BTC), sell : send a BTC value (get back USDC)
     def get_pairing_price(self, pairing: str, qty: Decimal, side: str = 'buy') -> tuple:
         side = side.lower()
         pairing = pairing.upper()
@@ -117,6 +119,7 @@ class Binance(Exchange):
             buy_asset = None
             buy_asset_qty = None
             symbol1, symbol2 = self._split_a_pairing(pairing, ret_valid_pairing=True)
+            lot_size = self._get_pairing_lot_size(pairing, side)
             for order in order_book:  # determines how much we'll have to pay using orderbook information
                 #  see binance's api documentation for more details
                 if 'USDC' in pairing:
@@ -137,12 +140,12 @@ class Binance(Exchange):
             elif book == 'bids':
                 buy_asset_qty = qty * price
                 buy_asset = symbol2
-            return self.format_a_decimal(buy_asset_qty), buy_asset
+            return self.format_a_decimal(buy_asset_qty, lot_size=lot_size), buy_asset
 
     # get_price_usdc() is like a get_pairing_price(), except it is exclusively USDC, and if a pairing
     # doesn't exist, it uses BTC as a go between and returns the appropriate values as though it did
     # so now we can get a USDC price for every asset available on Binance
-    def get_price_usdc(self, symbol: str, qty: Decimal, side: str = 'buy') -> Tuple[Decimal, str] or str:
+    def get_price_usdc(self, symbol: str, qty: Decimal, side: str = 'buy') -> tuple:
         symbol = symbol.upper()
         side = side.lower()
         input_check = self._input_check(None, side, qty, symbol)
@@ -150,7 +153,7 @@ class Binance(Exchange):
             return input_check
         else:
             if symbol == 'USDC':  # asking for the price of usdc in usdc lol
-                return self.format_a_decimal(qty), 'USDC'
+                return self.format_a_decimal(qty, lot_size='.001'), 'USDC'
             elif symbol == 'BTC':  # as explained in these comments, this pairing doesn't work in get_pairing_price()
                 # i think it's because binance's BTC tickers don't follow their other patterns
                 if side == 'buy':
@@ -190,7 +193,7 @@ class Binance(Exchange):
             balance_list = response['balances']
             for asset_dict in balance_list:
                 if asset_dict['asset'] == symbol:
-                    return self.format_a_decimal(Decimal(asset_dict['free'])), symbol
+                    return self.format_a_decimal(Decimal(asset_dict['free']), lot_size='.000001'), symbol
 
     # make the tax trade(s) before the main trade's function gets called
     # figures out the necessary trades to convert the given asset to the USDC amount given
@@ -201,7 +204,9 @@ class Binance(Exchange):
         if len(usdc_path) == 1:  # we have a direct pairing with USDC available
             pairing = self.get_valid_pairing('USDC', asset_being_sold)  # figure out how to buy USDC in a valid pairing
             # acquire USDC using execute_trade(), return how much was actually bought with Binance's response
-            return self.execute_trade(pairing[0], tax_due_usd, pairing[3])
+            if pairing[2] == 'USDC':
+                tax_due_usd = self.get_price_usdc(pairing[1], tax_due_usd, side='sell')
+            return self.execute_trade(pairing[0], tax_due_usd[0], pairing[3])
 
         # while relying on BTC as a bridge, len(usdc_path) will always be 2 here
         btc_pairing = self.get_valid_pairing(asset_being_sold, 'BTC')  # figure out how to buy BTC
@@ -221,7 +226,7 @@ class Binance(Exchange):
             side = 'BUY'
         if side == 'ASK':
             side = 'SELL'
-        lot_size = Decimal(self._get_pairing_lot_size(pairing))
+        lot_size = self._get_pairing_lot_size(pairing, side)
         qty = self.format_a_decimal(qty, lot_size=lot_size)
         qty = str(qty)
 
@@ -255,7 +260,7 @@ class Binance(Exchange):
         bal_after_acquiring = self.get_single_balance(asset_to_use)  # returns a Decimal
         amt_of_asset_acquired = Decimal(bal_after_acquiring[0]) - Decimal(bal_before_acquiring[0])
         # these are only casted as Decimal to humor my IDE ^
-        amt_of_asset_acquired = self.format_a_decimal(amt_of_asset_acquired)
+        amt_of_asset_acquired = self.format_a_decimal(amt_of_asset_acquired, lot_size=lot_size)
         return amt_of_asset_acquired, asset_to_use, result
         # returns a tuple: (Decimal containing amount acquired, asset acquired, binance's response to POST)
 
@@ -279,13 +284,14 @@ class Binance(Exchange):
         input_check = self._input_check(None, None, None, None, pairing_side)
         if input_check is not True:
             return input_check
-        else:
-            symbols_string = requests.get(self.API_URL + 'v1/exchangeInfo')
-            symbols_json = json.loads(symbols_string.text)
-            assets_set = set()
-            for item in symbols_json['symbols']:
-                assets_set.add(item[pairing_side + 'Asset'])  # add each asset to a set to remove duplicates
-            return tuple(assets_set)
+        symbols_string = requests.get(self.API_URL + 'v1/exchangeInfo')
+        symbols_json = json.loads(symbols_string.text)
+        assets_set = set()
+        if pairing_side == 'base':
+            assets_set.add('USDT')
+        for item in symbols_json['symbols']:
+            assets_set.add(item[pairing_side + 'Asset'])  # add each asset to a set to remove duplicates
+        return tuple(assets_set)
 
     # get_valid_pairing() returns a tuple for a valid pairing if one exists for the given assets
     # it returns the side assuming you want to acquire the first symbol in the parameters
@@ -354,11 +360,130 @@ class Binance(Exchange):
         # input will be checked in _split_a_pairing(), so no need for that here
         asset1 = ''
         asset2 = ''
-        for symbol in self._get_asset_symbols('base'):
+        if pairing_to_split == 'IOTAETH':  # it's finding 2 letter symbols in certain pairings by mistake
+            return 'IOTA', 'ETH'
+        if pairing_to_split == 'MDAETH':
+            return 'MDA', 'ETH'
+        if pairing_to_split == 'VIBETH':
+            return 'VIB', 'ETH'
+        if pairing_to_split == 'AIONBTC':
+            return 'AION', 'BTC'
+        if pairing_to_split == 'ELFETH':
+            return 'ELF', 'ETH'
+        if pairing_to_split == 'MANAETH':
+            return 'MANA', 'ETH'
+        if pairing_to_split == 'ADAETH':
+            return 'ADA', 'ETH'
+        if pairing_to_split == 'POAETH':
+            return 'POA', 'ETH'
+        if pairing_to_split == 'THETAETH':
+            return 'THETA', 'ETH'
+        if pairing_to_split == 'DATAETH':
+            return 'DATA', 'ETH'
+        if pairing_to_split == 'AIONETH':
+            return 'AION', 'ETH'
+        if pairing_to_split == 'AIONBNB':
+            return 'AION', 'BNB'
+        if pairing_to_split == 'TUSDBNB':
+            return 'TUSD', 'BNB'
+        if pairing_to_split == 'NAVETH':
+            return 'NAV', 'ETH'
+        if pairing_to_split == 'IOSTBTC':
+            return 'IOST', 'BTC'
+        if pairing_to_split == 'IOSTETH':
+            return 'IOST', 'ETH'
+        if pairing_to_split == 'VIAETH':
+            return 'VIA', 'ETH'
+        if pairing_to_split == 'WINGSETH':
+            return 'WINGS', 'ETH'
+        if pairing_to_split == 'BTCBBTC':
+            return 'BTCB', 'BTC'
+        if pairing_to_split == 'WINGSBTC':
+            return 'WINGS', 'BTC'
+        if pairing_to_split == 'ONTUSDT':
+            return 'ONT', 'USDT'
+        if pairing_to_split == 'TUSDBTC':
+            return 'TUSD', 'BTC'
+        if pairing_to_split == 'VIBEBTC':
+            return 'VIBE', 'BTC'
+        if pairing_to_split == 'VIBEETH':
+            return 'VIBE', 'ETH'
+        if pairing_to_split == 'EOSTUSD':
+            return 'EOS', 'TUSD'
+        if pairing_to_split == 'VETUSDT':
+            return 'VET', 'USDT'
+        if pairing_to_split == 'VETBNB':
+            return 'VET', 'BNB'
+        if pairing_to_split == 'VETBTC':
+            return 'VET', 'BTC'
+        if pairing_to_split == 'VETETH':
+            return 'VET', 'ETH'
+        if pairing_to_split == 'BTTUSDT':
+            return 'BTT', 'USDT'
+        if pairing_to_split == 'HOTUSDT':
+            return 'HOT', 'USDT'
+        if pairing_to_split == 'IOSTBNB':
+            return 'IOST', 'BNB'
+        if pairing_to_split == 'IOSTUSDT':
+            return 'IOST', 'USDT'
+        if pairing_to_split == 'USDSBUSDT':
+            return 'USDSB', 'USDT'
+        if pairing_to_split == 'USDSBUSDS':
+            return 'USDSB', 'USDS'
+        if pairing_to_split == 'TFUELBNB':
+            return 'TFUEL', 'BNB'
+        if pairing_to_split == 'TFUELBTC':
+            return 'TFUEL', 'BTC'
+        if pairing_to_split == 'TFUELUSDT':
+            return 'TFUEL', 'USDT'
+        if pairing_to_split == 'TFUELUSDC':
+            return 'TFUEL', 'USDC'
+        if pairing_to_split == 'TFUELTUSD':
+            return 'TFUEL', 'TUSD'
+        if pairing_to_split == 'TFUELPAX':
+            return 'TFUEL', 'PAX'
+        if pairing_to_split == 'FETUSDT':
+            return 'FET', 'USDT'
+        if pairing_to_split == 'TUSDBTUSD':
+            return 'TUSDB', 'TUSD'
+        if pairing_to_split == 'NPXSUSDT':
+            return 'NPXS', 'USDT'
+        if pairing_to_split == 'NPXSUSDC':
+            return 'NPXS', 'USDC'
+        if pairing_to_split == 'BCPTUSDC':
+            return 'BCPT', 'USDC'
+        if pairing_to_split == 'BATUSDT':
+            return 'BAT', 'USDT'
+        if pairing_to_split == 'BATUSDC':
+            return 'BAT', 'USDC'
+        if pairing_to_split == 'ALGOBNB':
+            return 'ALGO', 'BNB'
+        if pairing_to_split == 'ALGOBTC':
+            return 'ALGO', 'BTC'
+        if pairing_to_split == 'ALGOUSDT':
+            return 'ALGO', 'USDT'
+        if pairing_to_split == 'ALGOTUSD':
+            return 'ALGO', 'TUSD'
+        if pairing_to_split == 'ALGOPAX':
+            return 'ALGO', 'PAX'
+        if pairing_to_split == 'ALGOUSDC':
+            return 'ALGO', 'USDC'
+        if pairing_to_split == 'COCOSBNB':
+            return 'COCOS', 'BNB'
+        if pairing_to_split == 'COCOSBTC':
+            return 'COCOS', 'BTC'
+        if pairing_to_split == 'COCOSUSDT':
+            return 'COCOS', 'USDT'
+        if pairing_to_split == 'ONTUSDC':
+            return 'ONT', 'USDC'
+        if pairing_to_split == 'ONTPAX':
+            return 'ONT', 'PAX'
+        base_symbol_list = self._get_asset_symbols('base')
+        for symbol in base_symbol_list:
             if symbol in pairing_to_split:
                 asset1 = symbol
                 break
-        for symbol in self._get_asset_symbols('base'):
+        for symbol in base_symbol_list:
             if symbol in pairing_to_split and symbol not in asset1:
                 asset2 = pairing_to_split.replace(asset1, '')
                 break
@@ -459,12 +584,53 @@ class Binance(Exchange):
     #       symbol: 'ETH'
     #       pairing_side: 'quote' or 'base'
 
-    # I need this to determine the lot size in execute_trade()
-    def _get_pairing_lot_size(self, pairing: str) -> str:
+    # I need these to determine the lot size in execute_trade()
+    def _get_pairing_lot_size(self, pairing: str, side: str) -> str:
+        # fetches this pairing's lot size
+        this_lot = self._get_lot_size(pairing)
+        if side == 'sell':
+            return this_lot
+        # below corrects a buy side issue with IOTA, but will apply to other cryptos with very large supply
+        # fetches an alternate size
+        alt_pairing = self._get_alt_lot_pairing(pairing)
+        alt_lot = self._get_lot_size(alt_pairing)
+        # goes with whichever's bigger if side sent is 'buy'
+        if len(alt_lot) > len(this_lot):
+            return alt_lot
+        return this_lot
+
+    def _get_lot_size(self, pairing: str):
         symbols_string = requests.get(self.API_URL + 'v1/exchangeInfo')
         symbols_json = json.loads(symbols_string.text)
         for item in symbols_json['symbols']:
             if item['symbol'] == pairing:
                 for filter_dict in item['filters']:
                     if filter_dict['filterType'] == 'LOT_SIZE':
-                        return str(filter_dict['minQty'])[1:]
+                        return str(filter_dict['minQty']).rstrip('0')
+
+    # if there's any pairings where the sent base can be used as a quote, _pairing_with_given_base_as_quote()
+    # returns it, otherwise it returns None
+    # binance appears to default to the larger lot size for a symbol in a pair, so I have to compare two pairings
+    # to get an appropriate lot size
+    def _get_alt_lot_pairing(self, pairing: str) -> str:
+        quote, base = self._split_a_pairing(pairing)
+        if base == 'USDC':
+            return 'USDCBTC'
+        if base == 'ETH':
+            return 'ETHBTC'
+        if base == 'TUSD':
+            return 'TUSDBTC'
+        if base == 'USDS':
+            return 'USDSPAX'
+        if base == 'PAX':
+            return 'PAXBTC'
+        if base == 'TRX':
+            return 'TRXBTC'
+        if base == 'BNB':
+            return 'BNBBTC'
+        if base == 'BTC':
+            return 'BTCUSDT'
+        if base == 'XRP':
+            return 'XRPBTC'
+        if base == 'USDT':
+            return pairing
