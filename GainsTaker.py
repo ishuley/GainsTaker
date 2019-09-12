@@ -8,7 +8,6 @@ import hashlib
 import decimal
 from decimal import Decimal
 from typing import Tuple
-import pprint
 
 decimal.getcontext().prec = 100
 decimal_zero = Decimal()
@@ -78,8 +77,8 @@ class Binance(Exchange):
     def get_tax_due(self, spend_total_usd: Decimal, cost_basis_usd: Decimal = None, term: str = 'short') \
             -> Decimal or str:
         return self.format_a_decimal(super().get_tax_due(spend_total_usd, cost_basis_usd, term),
-                                     lot_size='.001', round_direction='ROUND_UP')
-        # LOT_SIZE of .001 here because although though usdc supports more decimal places,
+                                     lot_size='.01', round_direction='ROUND_UP')
+        # LOT_SIZE of .01 here because although though usdc supports more decimal places,
         # this will be getting rounded up for the tax man anyway
 
     # The following functions work with information from Binance using the following formats:
@@ -94,32 +93,27 @@ class Binance(Exchange):
     # with 'ETHUSDC' as 'pairing' in get_pairing_converted_value():
     # side = 'buy' to convert USDC value to ETH value
     # side = 'sell' to convert ETH value to USDC value
-    def get_pairing_converted_value(self, pairing: str, spend_amount: Decimal, side: str = 'buy') \
-            -> Tuple[Decimal, str] or str:
+    # this function starts taking a really long time when you get $200000+ deep in the order book
+    # TODO make this function estimate spends for crazy large amounts quickly
+    def get_pairing_converted_value(self, pairing: str, spend_amount: Decimal, side: str = 'buy') -> tuple:
         side = side.lower()
         pairing = pairing.upper()
         book = None
-        oside = None
         input_check = self._input_check(pairing=pairing, side=side, qty=spend_amount)
         if input_check is not True:
             return input_check
         if side == 'buy':
             book = 'asks'
-            oside = 'sell'  # TODO refactor then remove oside if execute trade needs its sides swapped too,
-            # then can just swap sides in _get_pairing_lot_size() to effect everything
         if side == 'sell':
             book = 'bids'
-            oside = 'buy'
         api_url = self.API_URL + "v1/depth"
-        orders = requests.get(api_url, params={'symbol': pairing, 'limit': 20})
+        orders = requests.get(api_url, params={'symbol': pairing, 'limit': 500})
         if orders.status_code >= 400:
             return orders.status_code
-        orders_json = orders.json()
-        # pprint.pprint(orders_json['bids'])
         running_cost = decimal_zero
         qty_counter = decimal_zero
-        lot_size = self._get_pairing_lot_size(pairing=pairing, side=oside)
-        for order in orders_json[book]:
+        lot_size = self._get_pairing_lot_size(pairing=pairing, side=side)
+        for order in orders.json()[book]:  # didn't assign these to variables so they'd be generated
             order_0, order_1 = Decimal(order[0]), Decimal(order[1])
             quote, base = self._split_a_pairing(pairing)
             cost = order_0 * order_1
@@ -142,22 +136,49 @@ class Binance(Exchange):
                 running_cost += order_1
                 qty_counter += cost
 
+    #  get_conversion estimate() will be a faster less accurate get_pairing_converted_value()
+    def get_conversion_estimate(self, pairing: str, spend_amount: Decimal, side: str = 'buy') -> tuple:
+        side = side.lower()
+        pairing = pairing.upper()
+        book = None
+        input_check = self._input_check(pairing=pairing, side=side, qty=spend_amount)
+        if input_check is not True:
+            return input_check
+        if side == 'buy':
+            book = 'asks'
+        if side == 'sell':
+            book = 'bids'
+        api_url = self.API_URL + "v1/depth"
+        orders = requests.get(api_url, params={'symbol': pairing, 'limit': 500})
+        if orders.status_code >= 400:
+            return orders.status_code
+        lot_size = self._get_pairing_lot_size(pairing=pairing, side=side)
+        pass
+
     # get_price_usdc() is like a get_pairing_price(), except it is exclusively USDC, and if a pairing
     # doesn't exist, it uses BTC as a go between and returns the appropriate values as though it did
     # so now we can get a USDC price for every asset available on Binance
-    def get_price_usdc(self, symbol: str, qty: Decimal, side: str = 'buy') -> tuple:
+    # if symbol is 'XMR': 'buy' means send usdc value return xmr value; 'sell' means send xmr value return usdc value
+    def get_price_usdc(self, symbol: str, qty: Decimal, side: str = 'buy', precise: bool = True) -> tuple:
         symbol = symbol.upper()
         side = side.lower()
         input_check = self._input_check(None, side, qty, symbol)
         if input_check is not True:
             return input_check
-        pass  # going to rewrite the thing
+        path_to_usdc = self._get_pairing_path_to_usdc(symbol=symbol)
+        if len(path_to_usdc) == 1:
+            return self.get_pairing_converted_value(pairing=path_to_usdc[0], spend_amount=qty, side=side)
+        if side == 'sell':
+            btc_qty = self.get_pairing_converted_value(pairing=path_to_usdc[0], spend_amount=qty, side='sell')
+            return self.get_pairing_converted_value(pairing=path_to_usdc[1], spend_amount=btc_qty[0], side='sell')
+        btc_qty = self.get_pairing_converted_value(pairing=path_to_usdc[1], spend_amount=qty, side='buy')
+        return self.get_pairing_converted_value(pairing=path_to_usdc[0], spend_amount=btc_qty[0], side='buy')
 
     # I'm going to include the option to use your entire remaining balance of an asset in a trade,
     # get_single_balance() will fetch that balance
     # I also ended up using this in execute_trade() to deduce the balance of new crypto after the transaction,
     # since I'm not seeing a way to do this through the API itself
-    def get_single_balance(self, symbol: str) -> Tuple[Decimal, str] or str:
+    def get_single_balance(self, symbol: str) -> tuple:
         symbol = symbol.upper()
         input_check = self._input_check(None, None, None, symbol)
         if input_check is not True:
@@ -176,30 +197,18 @@ class Binance(Exchange):
     # make the tax trade(s) before the main trade's function gets called
     # figures out the necessary trades to convert the given asset to the USDC amount given
     # then executes those trades using execute_trade()
-    def execute_tax_trade(self, asset_being_sold: str,  tax_due_usd: Decimal):
-        usdc_path = self._get_pairing_path_to_usdc(asset_being_sold)  # so we know HOW to buy USDC
-
-        if len(usdc_path) == 1:  # we have a direct pairing with USDC available
-            pairing = self.get_valid_pairing('USDC', asset_being_sold)  # figure out how to buy USDC in a valid pairing
-            # acquire USDC using execute_trade(), return how much was actually bought with Binance's response
-            if pairing[2] == 'USDC':
-                tax_due_usd = self.get_price_usdc(pairing[1], tax_due_usd, side='sell')
-            return self.execute_trade(pairing[0], tax_due_usd[0], pairing[3])
-
-        # while relying on BTC as a bridge, len(usdc_path) will always be 2 here
-        btc_pairing = self.get_valid_pairing(asset_being_sold, 'BTC')  # figure out how to buy BTC
-
-        # acquire BTC with execute_trade(), assign how much was actually bought to a variable
-        btc_received = self.execute_trade(btc_pairing[0], tax_due_usd, btc_pairing[3])[0]
-        return self.execute_trade('BTCUSDC', btc_received, 'sell')
+    def execute_tax_trade(self, asset_being_sold: str,  tax_due_usd: Decimal, precise: bool = True) -> tuple:
+        pass
         # format_a_decimal() isn't necessary in either of these conditionals because execute_trade() calls it
         # before returning
 
     # execute_trade() actually executes the trade
-    def execute_trade(self, pairing: str, qty: Decimal, side: str = 'buy') -> tuple:
+    def execute_trade(self, pairing: str, qty: Decimal, side: str = 'buy', precise: bool = True) -> tuple:
         pairing = pairing.upper()
         side = side.lower()  # make it lower because that's how i made my _input_check() want it
-        # input checks and formatting
+        input_check = self._input_check(pairing=pairing, side=side, qty=qty)
+        if input_check is not True:
+            return input_check
         side = side.upper()  # making it upper now to format for insertion into the query string
         lot_size = self._get_pairing_lot_size(pairing, side)
         qty = self.format_a_decimal(qty, lot_size=lot_size)
@@ -248,6 +257,11 @@ class Binance(Exchange):
         return_list = []
         for item in symbols_json['symbols']:
             return_list.append(item['symbol'])
+        return_list.remove('USDCBTC')
+        return_list.remove('USDCBNB')
+        return_list.remove('USDCUSDT')
+        return_list.remove('USDCTUSD')
+        return_list.remove('USDCPAX')
         return tuple(return_list)
 
     # _get_asset_symbols() returns a tuple of asset symbols
@@ -535,7 +549,9 @@ class Binance(Exchange):
                      pairing_side: str = None) -> bool or tuple:
         error_list = []
         if pairing is not None:
-            if not self._confirm_pairing_valid(pairing) or pairing == 'USDCBTC':
+            if not self._confirm_pairing_valid(pairing) or pairing == 'USDCBTC' \
+                    or pairing == 'USDCBNB' or pairing == 'USDCUSDT' or pairing == 'USDCTUSD'\
+                    or pairing == 'USDCPAX':
                 error_list.append('invalidPairing')
         if side is not None:
             if not self._confirm_valid_side(side):
@@ -564,13 +580,13 @@ class Binance(Exchange):
     def _get_pairing_lot_size(self, pairing: str, side: str) -> str:
         # fetches this pairing's lot size
         this_lot = self._get_lot_size(pairing)
-        if side == 'sell':
+        if side == 'buy':
             return this_lot
-        # below corrects a buy side issue with IOTA, but will apply to other cryptos with very large supply
+        # below corrects a sell side issue with IOTA, but will apply to other cryptos with very large supply
         # fetches an alternate size
         alt_pairing = self._get_alt_lot_pairing(pairing)
         alt_lot = self._get_lot_size(alt_pairing)
-        # goes with whichever's bigger if side sent is 'buy'
+        # goes with whichever's bigger if side sent is 'sell'
         if len(alt_lot) > len(this_lot):
             return alt_lot
         return this_lot
