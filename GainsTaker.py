@@ -15,8 +15,6 @@ decimal_zero = Decimal()
 
 # buy/bid and sell/ask always refers to the quote asset (the first asset) (ex: ARDRETH : buy ARDR or sell ARDR)
 # the second asset is the 'base' asset (ex: ETH is base asset in ARDRETH)
-# except in get_pairing_price, side of buy always refers to quote asset, side of sell always refers to base
-# examples in comments above the functions
 
 
 class Exchange(object):
@@ -113,9 +111,9 @@ class Binance(Exchange):
         running_cost = decimal_zero
         qty_counter = decimal_zero
         lot_size = self._get_pairing_lot_size(pairing=pairing, side=side)
-        for order in orders.json()[book]:  # didn't assign these to variables so they'd be generated
+        for order in orders.json()[book]:
             order_0, order_1 = Decimal(order[0]), Decimal(order[1])
-            quote, base = self._split_a_pairing(pairing)
+            quote, base = self.split_a_pairing(pairing)
             cost = order_0 * order_1
             if side == 'buy':
                 if cost + running_cost >= spend_amount:
@@ -137,7 +135,7 @@ class Binance(Exchange):
                 qty_counter += cost
 
     #  get_conversion estimate() will be a faster less accurate get_pairing_converted_value()
-    def get_conversion_estimate(self, pairing: str, spend_amount: Decimal, side: str = 'buy') -> tuple:
+    def _get_pairing_converted_estimate(self, pairing: str, spend_amount: Decimal, side: str = 'buy') -> tuple:
         side = side.lower()
         pairing = pairing.upper()
         book = None
@@ -174,25 +172,33 @@ class Binance(Exchange):
         btc_qty = self.get_pairing_converted_value(pairing=path_to_usdc[1], spend_amount=qty, side='buy')
         return self.get_pairing_converted_value(pairing=path_to_usdc[0], spend_amount=btc_qty[0], side='buy')
 
-    # I'm going to include the option to use your entire remaining balance of an asset in a trade,
-    # get_single_balance() will fetch that balance
-    # I also ended up using this in execute_trade() to deduce the balance of new crypto after the transaction,
-    # since I'm not seeing a way to do this through the API itself
-    def get_single_balance(self, symbol: str) -> tuple:
-        symbol = symbol.upper()
-        input_check = self._input_check(None, None, None, symbol)
-        if input_check is not True:
-            return input_check
-        else:
-            query_string = 'timestamp=' + str(int(time.time()) * 1000)
-            sig = self.get_signature(query_string)
-            balances = requests.get(self.API_URL + 'v3/account?' +
-                                    query_string + '&signature=' + sig, headers=self.headers)
-            response = balances.json()
-            balance_list = response['balances']
-            for asset_dict in balance_list:
-                if asset_dict['asset'] == symbol:
-                    return self.format_a_decimal(Decimal(asset_dict['free']), lot_size='.000001'), symbol
+    # get_balances() takes any number of symbols passed in as parameters, and yields balances in tuples
+    # if all_symbols is True, it yields all balances
+    # ex: get_balances('ETH', 'XMR', 'USDC', 'BNB')
+    # zero_balances does nothing if all_symbols isn't True
+    # sending symbols as *argv parameter with all_symbols turned on and zero balances off results
+    # in specified zero balances being displayed along with all nonzero balances
+    def get_balances(self, *args, all_symbols: bool = False, zero_balances: bool = False):
+        query_string = 'timestamp=' + str(int(time.time()) * 1000)
+        sig = self.get_signature(query_string)
+        balances = requests.get(self.API_URL + 'v3/account?' +
+                                query_string + '&signature=' + sig, headers=self.headers)
+        if all_symbols:
+            for asset_dict in balances.json()['balances']:
+                return_dec = self.format_a_decimal(Decimal(asset_dict['free']), lot_size='.000001')
+                if not zero_balances and return_dec != decimal_zero:
+                    yield return_dec, asset_dict['asset']
+                elif zero_balances:
+                    yield return_dec, asset_dict['asset']
+        for symbol in args:
+            symbol = symbol.upper()
+            input_check = self._input_check(None, None, None, symbol)
+            if input_check is not True:
+                return input_check
+            else:
+                for asset_dict in balances.json()['balances']:
+                    if asset_dict['asset'] == symbol:
+                        yield self.format_a_decimal(Decimal(asset_dict['free']), lot_size='.000001'), symbol
 
     # make the tax trade(s) before the main trade's function gets called
     # figures out the necessary trades to convert the given asset to the USDC amount given
@@ -219,12 +225,12 @@ class Binance(Exchange):
         # so it can be returned, I don't see a way to do this through Binance API
         # an alternative approach might've been to use newOrderRespType=FULL below, and
         # derive it from the 'fills' values, but this seemed easier
-        quote_asset, base_asset = self._split_a_pairing(pairing)
+        quote_asset, base_asset = self.split_a_pairing(pairing)
         if side == 'BUY':
             asset_to_use = quote_asset
         else:
             asset_to_use = base_asset
-        bal_before_acquiring = self.get_single_balance(asset_to_use)
+        bal_before_acquiring = tuple(self.get_balances(asset_to_use))
 
         # construct the query_string and signature
         symbol = 'symbol=' + pairing + '&'
@@ -241,8 +247,8 @@ class Binance(Exchange):
 
         # parse and return results
         result = order.json()
-        bal_after_acquiring = self.get_single_balance(asset_to_use)  # returns a Decimal
-        amt_of_asset_acquired = Decimal(bal_after_acquiring[0]) - Decimal(bal_before_acquiring[0])
+        bal_after_acquiring = tuple(self.get_balances(asset_to_use))  # returns a Decimal
+        amt_of_asset_acquired = Decimal(bal_after_acquiring[0][0]) - Decimal(bal_before_acquiring[0][0])
         # these are only casted as Decimal to humor my IDE ^
         amt_of_asset_acquired = self.format_a_decimal(amt_of_asset_acquired, lot_size=lot_size)
         return amt_of_asset_acquired, asset_to_use, result
@@ -267,8 +273,8 @@ class Binance(Exchange):
     # _get_asset_symbols() returns a tuple of asset symbols
     # pairing_side:'quote' produces a list of symbols that are the first part of a pairing
     # pairing_side:'base' produces a list of symbols that are in the second part (all of them,
-    # in one pairing or another. use 'base' to generate a list of every asset binance handles
-    def _get_asset_symbols(self, pairing_side: str) -> tuple:
+    # in one pairing or another. use 'base to generate a list of every asset binance handles
+    def _get_asset_symbols(self, pairing_side: str = 'base') -> tuple:
         pairing_side = pairing_side.lower()
         input_check = self._input_check(None, None, None, None, pairing_side)
         if input_check is not True:
@@ -278,6 +284,7 @@ class Binance(Exchange):
         assets_set = set()
         if pairing_side == 'base':
             assets_set.add('USDT')
+            assets_set.add('USDC')
         for item in symbols_json['symbols']:
             assets_set.add(item[pairing_side + 'Asset'])  # add each asset to a set to remove duplicates
         return tuple(assets_set)
@@ -318,7 +325,7 @@ class Binance(Exchange):
     # if ret_valid_pairing is False it returns two valid symbols in the order passed in,
     # regardless of if there's a valid pairing
     # if ret_valid_pairing is True it will flip the symbols around to make a valid pairing if necessary
-    def _split_a_pairing(self, pairing_to_split: str, ret_valid_pairing: bool = False) -> Tuple[str, str] or str:
+    def split_a_pairing(self, pairing_to_split: str, ret_valid_pairing: bool = False) -> Tuple[str, str] or str:
         quote_asset, base_asset = self._pair_splitter(pairing_to_split)
         input_check_qa = self._input_check(symbol=quote_asset)
         input_check_ba = self._input_check(symbol=base_asset)
@@ -347,139 +354,14 @@ class Binance(Exchange):
     # does the actual splitting for _split_a_pairing()
     def _pair_splitter(self, pairing_to_split: str) -> Tuple[str, str]:
         # input will be checked in _split_a_pairing(), so no need for that here
-        asset1 = ''
-        asset2 = ''
-        if pairing_to_split == 'IOTAETH':  # it's finding 2 letter symbols in certain pairings by mistake
-            return 'IOTA', 'ETH'
-        if pairing_to_split == 'MDAETH':
-            return 'MDA', 'ETH'
-        if pairing_to_split == 'VIBETH':
-            return 'VIB', 'ETH'
-        if pairing_to_split == 'AIONBTC':
-            return 'AION', 'BTC'
-        if pairing_to_split == 'ELFETH':
-            return 'ELF', 'ETH'
-        if pairing_to_split == 'MANAETH':
-            return 'MANA', 'ETH'
-        if pairing_to_split == 'ADAETH':
-            return 'ADA', 'ETH'
-        if pairing_to_split == 'POAETH':
-            return 'POA', 'ETH'
-        if pairing_to_split == 'THETAETH':
-            return 'THETA', 'ETH'
-        if pairing_to_split == 'DATAETH':
-            return 'DATA', 'ETH'
-        if pairing_to_split == 'AIONETH':
-            return 'AION', 'ETH'
-        if pairing_to_split == 'AIONBNB':
-            return 'AION', 'BNB'
-        if pairing_to_split == 'TUSDBNB':
-            return 'TUSD', 'BNB'
-        if pairing_to_split == 'NAVETH':
-            return 'NAV', 'ETH'
-        if pairing_to_split == 'IOSTBTC':
-            return 'IOST', 'BTC'
-        if pairing_to_split == 'IOSTETH':
-            return 'IOST', 'ETH'
-        if pairing_to_split == 'VIAETH':
-            return 'VIA', 'ETH'
-        if pairing_to_split == 'WINGSETH':
-            return 'WINGS', 'ETH'
-        if pairing_to_split == 'BTCBBTC':
-            return 'BTCB', 'BTC'
-        if pairing_to_split == 'WINGSBTC':
-            return 'WINGS', 'BTC'
-        if pairing_to_split == 'ONTUSDT':
-            return 'ONT', 'USDT'
-        if pairing_to_split == 'TUSDBTC':
-            return 'TUSD', 'BTC'
-        if pairing_to_split == 'VIBEBTC':
-            return 'VIBE', 'BTC'
-        if pairing_to_split == 'VIBEETH':
-            return 'VIBE', 'ETH'
-        if pairing_to_split == 'EOSTUSD':
-            return 'EOS', 'TUSD'
-        if pairing_to_split == 'VETUSDT':
-            return 'VET', 'USDT'
-        if pairing_to_split == 'VETBNB':
-            return 'VET', 'BNB'
-        if pairing_to_split == 'VETBTC':
-            return 'VET', 'BTC'
-        if pairing_to_split == 'VETETH':
-            return 'VET', 'ETH'
-        if pairing_to_split == 'BTTUSDT':
-            return 'BTT', 'USDT'
-        if pairing_to_split == 'HOTUSDT':
-            return 'HOT', 'USDT'
-        if pairing_to_split == 'IOSTBNB':
-            return 'IOST', 'BNB'
-        if pairing_to_split == 'IOSTUSDT':
-            return 'IOST', 'USDT'
-        if pairing_to_split == 'USDSBUSDT':
-            return 'USDSB', 'USDT'
-        if pairing_to_split == 'USDSBUSDS':
-            return 'USDSB', 'USDS'
-        if pairing_to_split == 'TFUELBNB':
-            return 'TFUEL', 'BNB'
-        if pairing_to_split == 'TFUELBTC':
-            return 'TFUEL', 'BTC'
-        if pairing_to_split == 'TFUELUSDT':
-            return 'TFUEL', 'USDT'
-        if pairing_to_split == 'TFUELUSDC':
-            return 'TFUEL', 'USDC'
-        if pairing_to_split == 'TFUELTUSD':
-            return 'TFUEL', 'TUSD'
-        if pairing_to_split == 'TFUELPAX':
-            return 'TFUEL', 'PAX'
-        if pairing_to_split == 'FETUSDT':
-            return 'FET', 'USDT'
-        if pairing_to_split == 'TUSDBTUSD':
-            return 'TUSDB', 'TUSD'
-        if pairing_to_split == 'NPXSUSDT':
-            return 'NPXS', 'USDT'
-        if pairing_to_split == 'NPXSUSDC':
-            return 'NPXS', 'USDC'
-        if pairing_to_split == 'BCPTUSDC':
-            return 'BCPT', 'USDC'
-        if pairing_to_split == 'BATUSDT':
-            return 'BAT', 'USDT'
-        if pairing_to_split == 'BATUSDC':
-            return 'BAT', 'USDC'
-        if pairing_to_split == 'ALGOBNB':
-            return 'ALGO', 'BNB'
-        if pairing_to_split == 'ALGOBTC':
-            return 'ALGO', 'BTC'
-        if pairing_to_split == 'ALGOUSDT':
-            return 'ALGO', 'USDT'
-        if pairing_to_split == 'ALGOTUSD':
-            return 'ALGO', 'TUSD'
-        if pairing_to_split == 'ALGOPAX':
-            return 'ALGO', 'PAX'
-        if pairing_to_split == 'ALGOUSDC':
-            return 'ALGO', 'USDC'
-        if pairing_to_split == 'COCOSBNB':
-            return 'COCOS', 'BNB'
-        if pairing_to_split == 'COCOSBTC':
-            return 'COCOS', 'BTC'
-        if pairing_to_split == 'COCOSUSDT':
-            return 'COCOS', 'USDT'
-        if pairing_to_split == 'ONTUSDC':
-            return 'ONT', 'USDC'
-        if pairing_to_split == 'ONTPAX':
-            return 'ONT', 'PAX'
-        # TODO there's gotta be a better way to handle this
-        base_symbol_list = self._get_asset_symbols('base')
-        for symbol in base_symbol_list:
-            if symbol in pairing_to_split:
-                asset1 = symbol
-                break
-        for symbol in base_symbol_list:
-            if symbol in pairing_to_split and symbol not in asset1:
-                asset2 = pairing_to_split.replace(asset1, '')
-                break
-        if asset2 + asset1 == pairing_to_split:
-            return asset2, asset1
-        return asset1, asset2
+        while True:
+            for symbol in self._get_asset_symbols():
+                if symbol == pairing_to_split[0:len(symbol)]:
+                    quote = symbol
+                    base = pairing_to_split[len(symbol):]
+                    base_check = self._input_check(symbol=base)
+                    if base_check is True:
+                        return quote, base
 
     # USDC is the asset this program has to use every single transaction, so if a pairing with it
     # doesn't exist this function returns a 'pairing path' to USDC so I can pay the tax man
@@ -520,7 +402,7 @@ class Binance(Exchange):
         return False
 
     def _confirm_symbol_valid(self, symbol: str) -> bool:
-        for item in self._get_asset_symbols('base'):
+        for item in self._get_asset_symbols():
             if symbol == item:
                 return True
         return False
@@ -570,7 +452,7 @@ class Binance(Exchange):
         return tuple(error_list)
 
     #   Examples:
-    #       pairing: 'USDCBTC'
+    #       pairing: 'ETHUSDC'
     #       side: 'buy' or 'sell'
     #       qty: decimal.Decimal('4.513')
     #       symbol: 'ETH'
@@ -605,7 +487,7 @@ class Binance(Exchange):
     # binance appears to default to the larger lot size for a symbol in a pair, so I have to compare two pairings
     # to get an appropriate lot size
     def _get_alt_lot_pairing(self, pairing: str) -> str:
-        quote, base = self._split_a_pairing(pairing)
+        quote, base = self.split_a_pairing(pairing)
         if base == 'USDC':
             return 'USDCBTC'
         if base == 'ETH':
