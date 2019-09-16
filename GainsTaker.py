@@ -91,7 +91,7 @@ class Binance(Exchange):
     # with 'ETHUSDC' as 'pairing' in get_pairing_converted_value():
     # side = 'buy' to convert USDC value to ETH value
     # side = 'sell' to convert ETH value to USDC value
-    # this function starts taking a really long time when you get $200000+ deep in the order book
+    # API seems to only return the order books about 1,000,000 USD deep
     # TODO make this function estimate spends for crazy large amounts quickly
     def get_pairing_converted_value(self, pairing: str, spend_amount: Decimal, side: str = 'buy') -> tuple:
         side = side.lower()
@@ -105,15 +105,15 @@ class Binance(Exchange):
         if side == 'sell':
             book = 'bids'
         api_url = self.API_URL + "v1/depth"
-        orders = requests.get(api_url, params={'symbol': pairing, 'limit': 500})
+        orders = requests.get(api_url, params={'symbol': pairing, 'limit': 1000})
         if orders.status_code >= 400:
             return orders.status_code
         running_cost = decimal_zero
         qty_counter = decimal_zero
+        quote, base = self.split_a_pairing(pairing)
         lot_size = self._get_pairing_lot_size(pairing=pairing, side=side)
         for order in orders.json()[book]:
             order_0, order_1 = Decimal(order[0]), Decimal(order[1])
-            quote, base = self.split_a_pairing(pairing)
             cost = order_0 * order_1
             if side == 'buy':
                 if cost + running_cost >= spend_amount:
@@ -134,30 +134,11 @@ class Binance(Exchange):
                 running_cost += order_1
                 qty_counter += cost
 
-    #  get_conversion estimate() will be a faster less accurate get_pairing_converted_value()
-    def _get_pairing_converted_estimate(self, pairing: str, spend_amount: Decimal, side: str = 'buy') -> tuple:
-        side = side.lower()
-        pairing = pairing.upper()
-        book = None
-        input_check = self._input_check(pairing=pairing, side=side, qty=spend_amount)
-        if input_check is not True:
-            return input_check
-        if side == 'buy':
-            book = 'asks'
-        if side == 'sell':
-            book = 'bids'
-        api_url = self.API_URL + "v1/depth"
-        orders = requests.get(api_url, params={'symbol': pairing, 'limit': 500})
-        if orders.status_code >= 400:
-            return orders.status_code
-        lot_size = self._get_pairing_lot_size(pairing=pairing, side=side)
-        pass
-
     # get_price_usdc() is like a get_pairing_price(), except it is exclusively USDC, and if a pairing
     # doesn't exist, it uses BTC as a go between and returns the appropriate values as though it did
     # so now we can get a USDC price for every asset available on Binance
     # if symbol is 'XMR': 'buy' means send usdc value return xmr value; 'sell' means send xmr value return usdc value
-    def get_price_usdc(self, symbol: str, qty: Decimal, side: str = 'buy', precise: bool = True) -> tuple:
+    def get_price_usdc(self, symbol: str, qty: Decimal, side: str = 'buy') -> tuple:
         symbol = symbol.upper()
         side = side.lower()
         input_check = self._input_check(None, side, qty, symbol)
@@ -178,17 +159,19 @@ class Binance(Exchange):
     # zero_balances does nothing if all_symbols isn't True
     # sending symbols as *argv parameter with all_symbols turned on and zero balances off results
     # in specified zero balances being displayed along with all nonzero balances
-    def get_balances(self, *args, all_symbols: bool = False, zero_balances: bool = False):
+    def get_balances(self, *args, all_symbols: bool = False, show_zero_balances: bool = False):
         query_string = 'timestamp=' + str(int(time.time()) * 1000)
         sig = self.get_signature(query_string)
         balances = requests.get(self.API_URL + 'v3/account?' +
                                 query_string + '&signature=' + sig, headers=self.headers)
+        if balances.status_code >= 400:
+            return balances.status_code
         if all_symbols:
             for asset_dict in balances.json()['balances']:
                 return_dec = self.format_a_decimal(Decimal(asset_dict['free']), lot_size='.000001')
-                if not zero_balances and return_dec != decimal_zero:
+                if not show_zero_balances and return_dec != decimal_zero:
                     yield return_dec, asset_dict['asset']
-                elif zero_balances:
+                elif show_zero_balances:
                     yield return_dec, asset_dict['asset']
         for symbol in args:
             symbol = symbol.upper()
@@ -209,7 +192,7 @@ class Binance(Exchange):
         # before returning
 
     # execute_trade() actually executes the trade
-    def execute_trade(self, pairing: str, qty: Decimal, side: str = 'buy', precise: bool = True) -> tuple:
+    def execute_trade(self, pairing: str, qty: Decimal, side: str = 'buy') -> tuple:
         pairing = pairing.upper()
         side = side.lower()  # make it lower because that's how i made my _input_check() want it
         input_check = self._input_check(pairing=pairing, side=side, qty=qty)
@@ -244,6 +227,8 @@ class Binance(Exchange):
 
         # POST the order
         order = requests.post(self.API_URL + 'v3/order?' + query_string + '&signature=' + sig, headers=self.headers)
+        if order.status_code >= 400:
+            return order.status_code
 
         # parse and return results
         result = order.json()
@@ -475,6 +460,8 @@ class Binance(Exchange):
 
     def _get_lot_size(self, pairing: str):
         symbols_string = requests.get(self.API_URL + 'v1/exchangeInfo')
+        if symbols_string.status_code >= 400:
+            return symbols_string.status_code
         symbols_json = symbols_string.json()
         for item in symbols_json['symbols']:
             if item['symbol'] == pairing:
