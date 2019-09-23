@@ -35,7 +35,7 @@ class Exchange(object):
     # my take is to implement that in a get_tax_due() function in the subclass that
     # returns a formatted super().get_tax_due()
     @staticmethod
-    def get_tax_due(spend_total_usd: Decimal, cost_basis_usd: Decimal = None, term: str = 'short')\
+    def get_tax_due(spend_total_usd: Decimal, cost_basis_usd: Decimal = None, term: str = 'short') \
             -> Decimal or str:
         term = term.lower()
         if term != 'short' and term != 'long':
@@ -186,10 +186,20 @@ class Binance(Exchange):
     # make the tax trade(s) before the main trade's function gets called
     # figures out the necessary trades to convert the given asset to the USDC amount given
     # then executes those trades using execute_trade()
-    def execute_tax_trade(self, asset_being_sold: str,  tax_due_usd: Decimal, precise: bool = True) -> tuple:
-        pass
+    def execute_tax_trade(self, asset_being_sold: str,  tax_due_usd: Decimal) -> tuple:
+        path_to_usdc = self._get_pairing_path_to_usdc(symbol=asset_being_sold)
+        tax_due_as_sym = self.get_price_usdc(symbol=asset_being_sold, qty=tax_due_usd, side='buy')[0]
+        if len(path_to_usdc) == 1:
+            symusdc = path_to_usdc[0]
+            return self.execute_trade(pairing=symusdc, qty=tax_due_as_sym, side='sell')
+        symbtc = path_to_usdc[0]
+        btcusdc = path_to_usdc[1]
+        tax_to_btc = self.execute_trade(pairing=symbtc, qty=tax_due_as_sym, side='sell')[0]
+        return self.execute_trade(pairing=btcusdc, qty=tax_to_btc, side='sell')
         # format_a_decimal() isn't necessary in either of these conditionals because execute_trade() calls it
         # before returning
+    #     TODO this is untested, spun it while running a different OS where I don't have my API keys
+    #     TODO add commit description to record on ubuntu
 
     # execute_trade() actually executes the trade
     def execute_trade(self, pairing: str, qty: Decimal, side: str = 'buy') -> tuple:
@@ -417,7 +427,7 @@ class Binance(Exchange):
         error_list = []
         if pairing is not None:
             if not self._confirm_pairing_valid(pairing) or pairing == 'USDCBTC' \
-                    or pairing == 'USDCBNB' or pairing == 'USDCUSDT' or pairing == 'USDCTUSD'\
+                    or pairing == 'USDCBNB' or pairing == 'USDCUSDT' or pairing == 'USDCTUSD' \
                     or pairing == 'USDCPAX':
                 error_list.append('invalidPairing')
         if side is not None:
